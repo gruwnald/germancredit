@@ -1,0 +1,960 @@
+---
+title: "Predicting German Credit Default using logistic regression"
+author:
+  - Jerzy Grunwald
+fontsize: 10pt
+date: \today
+header-includes:
+   - \usepackage[utf8]{inputenc}
+   - \usepackage{graphicx}
+   - \usepackage{float}
+   - \usepackage{verbatim}
+   - \usepackage{subfig}
+   - \usepackage{multicol}
+output: 
+  bookdown::pdf_document2: 
+    number_sections: false
+    toc: true
+    extra_dependencies:
+    - "float"
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, comment = "")
+knitr::opts_chunk$set(fig.height = 3.75, fig.pos = "H", out.extra = "")
+```
+
+```{r packages}
+library(xtable)
+library(ggplot2)
+library(scorecard)
+library(rsample)
+library(gridExtra)
+library(dplyr)
+library(pROC)
+```
+
+# Introduction
+
+We will focus on the task of credit scoring and related classification. Based on data regarding German bank clients, we will examine important features that affect creditability. We will also analyse methods of assessing classifier performance and optimal threshold selection.
+
+\newpage
+
+# Descriptive analysis
+
+```{r load-data}
+set.seed(271)
+data <- germancredit
+# sum(is.na(data))
+# str(data)
+features.number <- ncol(data)-1
+```
+
+`German Credit Data` is a dataset containing `r nrow(germancredit)` rows describing bank clients. Their characteristics are described using `r features.number` features, based on which we will try to predict binary variable `creditability`. Said variable informs us, whether the client is good, i.e. pays their rates on time, or bad. Below we provide description of every feature. DM stands for Deutsche Mark, which was the currency in Germany at the time of data collection.
+
+Each feature will be described in a following manner: `feature name` (type [factor, numeric, character]) -- description.
+
+* `status.of.existing.checking.account` (factor, 4 levels) -- money ammount in clients checking account,
+
+* `duration.in.month` (numeric) -- credit duration in months,
+
+* `credit.history` (factor, 5 levels) -- clients credit history,
+
+* `purpose` (character) -- what is the loan needed for,
+
+* `credit.amount` (numeric) -- loan ammount,
+
+* `savings.accout.and.bonds` (factor, 5 levels) -- money on clients savings account and/or in bonds,
+
+* `present.employment.since` (factor, 5 levels) -- how long has the client worked at their current job,
+
+* `installment.rate.in.percentage.of.disposable.income` (numeric) -- loan installment as a percentage of clients disposable income,
+
+* `personal.status.and.sex` (factor, 5 levels) -- gender and matrimonial status,
+
+* `other.debtors.or.guarantors` (factor, 3 levels) -- is the client the only debtor, are there others, or is the client a guarantor,
+
+* `present.residence.since` (numeric) -- years since the client has moved to their present residence,
+
+* `property` (factor, 4 levels) -- clients property (house, car, etc.),
+
+* `age.in.years` (numeric) -- clients age in years,
+
+* `other.installment.plans` (factor, 3 levels) -- other creditors,
+
+* `housing` (factor, 3 levels) -- does the client rent, own or live for free in their current residence,
+
+* `number.of.existing.credits.at.this.bank` (numeric) -- number of clients loans at this bank,
+
+* `job` (factor, 4 levels) -- is the client employed and how qualified is he,
+
+* `number.of.people.being.liable.to.provide.maintenance.for` (numeric) -- number of people client has to provide for,
+
+* `telephone` (factor, 2 levels) -- does the client have a telephone number,
+
+* `foreign.worker` (factor, 2 levels) -- is the client a foreign worker.
+
+The response is `creditability`. it is a binary variable with levels `good` -- in case the client pays their rates on time and `bad` -- in case they don't.
+
+There is no missing data. Variable `purpose` is of type character, so to enable proper analysis, we change its type to factor with 11 levels. In case of `personal.status.and.sex`, we notice unussed level `female: single`, thus we delete it.
+
+```{r data-manipulation}
+# lapply(data, summary) # summary of every variable
+data$purpose <- as.factor(data$purpose)
+data <- droplevels(data)
+attach(data)
+```
+
+# Data split
+
+Using `initial_split()` from `rsample` package, we split the dataset into training (80% of records) and test (20% of records) datasets. The training dataset will be used to build and train prediction models, which will be later evaluated using the test dataset.
+
+```{r data-split}
+split <- initial_split(data = data, prop = 0.8)
+train <- training(split)
+test <- testing(split)
+```
+
+# Logistic regression model selection
+
+We will fit logistic regression models. they are parametric models of the form
+\begin{equation}\label{logreg}
+  \log \frac{p(\mathbf{x})}{1 - p(\mathbf{x})} = \beta^T\mathbf{x},
+\end{equation}
+where $p(\mathbf{x})$ is the probability that client of characteristic $\mathbf{x}$ is a good client, $\beta$ is a vector of parameters.
+
+Classification rule, or in short a classifier, we will call a function
+\begin{equation}\label{regklas}
+  d(\mathbf{x}) =
+    \begin{cases}
+      1, & \text{when $p(\mathbf{x}) > c$}\\
+      0, & \text{when $p(\mathbf{x}) \leq c$}
+    \end{cases}       
+\end{equation}
+where $c$ is a fixed number (often called a threshold) from the interval $[0, 1]$. We begin by taking  $c=\frac12$.
+
+From model given by the equation \eqref{logreg}, we can extract the formula for the probability of success:
+\begin{equation*}
+  p(\mathbf{x}) = \frac{1}{1 + \exp\left(-\beta^T\mathbf{x}\right)}.
+\end{equation*}
+
+Due to the fact, that the formula on the right takes values only from the interval $[0, 1]$, $p(\mathbf{x})$ is a reasonable estimator for the probability of success. Logistic regression is not the only model with that property (there are also regression models such as probit, log-log, complementary log-log), however it is a popular and easily interpretable model, performing well with classification tasks. We will now focus on criteria allowing us to identify features significantly impacting $p(\mathbf{x})$.
+
+## Feature selection based on information criteria
+
+Careful feature selection allows us to create better, more accurate and easier to interpret classifier. By focusing only on important features, model will adjust parameters better and lower the risk of overfitting.
+
+The selection will be conducted using the `step()` function from `stats` package. We will use three step methods, that will create a model minimising given information criteria. By taking $k=2$ in `step()`, model will be chosen by minimizing AIC, while with $k=\ln(n)$, where $n$ is the number of rows in our dataset, we obtain a model minimizing BIC.
+\begin{itemize}
+\item Forward method
+\begin{enumerate}
+\item Using the function \texttt{glm()} we create a logistic regression model with no predictors.
+\item We add more predictors to the model as long as adding any lowers the value of chosen criterium.
+\end{enumerate}
+\item Backward method
+\begin{enumerate}
+\item Using the function \texttt{glm()} we create a logistic regression model with all possible predictors.
+\item We remove predictors from the model as long as removing any lowers the value of chosen criterium.
+\end{enumerate}
+\item Both method
+\begin{enumerate}
+\item Using the function \texttt{glm()} we create a logistic regression model with no predictors.
+\item In each step we either add or remove a predictor, whichever causes a greater decrease in criterium value.
+\item We stop, when adding or removing any feature would increase the criterium value.
+\end{enumerate}
+\end{itemize}
+
+```{r step-models-AIC}
+# Full model
+model.glm <- glm(data = train,
+                 formula = creditability~.,
+                 family = binomial("logit"))
+
+
+# Empty model
+model.glm.simple <- glm(data = train,
+                 formula = creditability~1,
+                 family = binomial("logit"))
+
+model.AIC.forward <- step(object = model.glm.simple,
+                          direction = "forward",
+                          scope = list(lower = model.glm.simple,
+                                       upper = model.glm),
+                          k = 2,
+                          trace=0
+                          )
+
+model.AIC.backward <- step(object = model.glm,
+                          direction = "backward",
+                          scope = list(lower = model.glm.simple,
+                                       upper = model.glm),
+                          k = 2,
+                          trace=0
+)
+
+model.AIC.both <- step(object = model.glm.simple,
+                       direction = "both",
+                       scope = list(lower = model.glm.simple,
+                                    upper = model.glm),
+                       k = 2,
+                       trace=0
+)
+```
+
+```{r step-models-BIC}
+model.BIC.forward <- step(object = model.glm.simple,
+                          direction = "forward",
+                          scope = list(lower = model.glm.simple,
+                                       upper = model.glm),
+                          k = log(nrow(train)),
+                          trace=0
+)
+
+model.BIC.backward <- step(object = model.glm,
+                          direction = "backward",
+                          scope = list(lower = model.glm.simple,
+                                       upper = model.glm),
+                          k = log(nrow(train)),
+                          trace=0
+)
+
+model.BIC.both <- step(object = model.glm.simple,
+                       direction = "both",
+                       scope = list(lower = model.glm.simple,
+                                     upper = model.glm),
+                       k = log(nrow(train)),
+                       trace=0
+)
+```
+Lets compare information criteria of our models.
+
+```{r comp, results='asis'}
+aic.vec <- c(model.AIC.forward$aic,
+             model.AIC.backward$aic,
+             model.AIC.both$aic,
+             model.BIC.forward$aic,
+             model.BIC.backward$aic,
+             model.BIC.both$aic)
+bic.vec <- c(extractAIC(model.AIC.forward, k=log(nrow(train)))[2],
+             extractAIC(model.AIC.backward, k=log(nrow(train)))[2],
+             extractAIC(model.AIC.both, k=log(nrow(train)))[2],
+             extractAIC(model.BIC.forward, k=log(nrow(train)))[2],
+             extractAIC(model.BIC.backward, k=log(nrow(train)))[2],
+             extractAIC(model.BIC.both, k=log(nrow(train)))[2])
+
+tab <- matrix(c(aic.vec, bic.vec), byrow = FALSE, nrow = 6)
+rownames(tab) <- c("model AIC forward", "model AIC backward", "model AIC both",
+                   "model BIC forward", "model BIC backward", "model BIC both")
+colnames(tab) <- c("AIC", "BIC")
+tab <- xtable(tab, caption = "Information criteria of logistic regression models", digits = c(0, 2, 2), align=c("l", "r", "r"), label = "kryt.inf")
+print(tab, table.placement = "H", comment=FALSE)
+```
+Table \ref{kryt.inf} shows AIC and BIC values of six considered models. By "model `criterium` `method`" we understand logistic regression model, in which features were selected using step method `method` in such a way, that minimizes `criterium`.
+
+Let us note, that the first three models have the same AIC and BIC values, same as the last three. We will thus check, if they are not by chance the same model.
+
+```{r identical-check}
+# czy są to te same modele wg AIC ?
+cat(paste0("\t Are model AIC forward and model AIC backward the same? ", identical(sort(names(model.AIC.forward$coefficients)),
+          sort(names(model.AIC.backward$coefficients))), "\n"))
+
+cat(paste0("\t Are model AIC forward and model AIC both the same? ",
+identical(sort(names(model.AIC.forward$coefficients)),
+          sort(names(model.AIC.both$coefficients))), "\n"))
+
+# czy są to te same modele wg BIC ?
+cat(paste0("\t Are model BIC forward and model BIC backward the same? ", identical(sort(names(model.BIC.forward$coefficients)),
+          sort(names(model.BIC.backward$coefficients))), "\n"))
+
+cat(paste0("\t Are model BIC forward and model BIC both the same? ",
+identical(sort(names(model.BIC.forward$coefficients)),
+          sort(names(model.BIC.both$coefficients))), "\n"))
+
+cat(paste0("\t Are model AIC forward and model BIC forward the same? ",
+identical(sort(names(model.AIC.forward$coefficients)),
+          sort(names(model.BIC.forward$coefficients)))))
+```
+
+For both criteria, the choice of step method does not impact feature selection. We get two distinct models, one chosen by minimizing AIC, the other by BIC. From now on they will be refered to as  `model.AIC` and `model.BIC`. Let us examine the predictors chosen by each of them.
+
+```{r}
+model.AIC <- model.AIC.forward
+model.BIC <- model.BIC.forward
+```
+
+Features in `model.AIC`:
+```{r aic-analysis}
+names <- colnames(model.AIC$model)
+names <- names[! names %in% "creditability"]
+
+# Text alignment (there has to be a better way)
+if (length(names) <= 9){
+  separator = rep(".", length(names))
+} else {
+  separator = c(rep(". ", 9), rep(".", length(names) - 9))
+}
+
+nums <- paste(1:length(names), separator, sep = "")
+cat(paste("\t", nums, names), sep="\n")
+```
+
+Features in `model.BIC`:
+```{r bic-analysis}
+names <- colnames(model.BIC$model)
+names <- names[! names %in% "creditability"]
+
+if (length(names) <= 9){
+  separator = rep(".", length(names))
+} else {
+  separator = c(rep(". ", 9), rep(".", length(names) - 9))
+}
+
+nums <- paste(1:length(names), separator, sep = "")
+cat(paste("\t", nums, names), sep="\n")
+```
+
+`model.AIC` has more features than `model.BIC`. It is to be expected, since the only difference between the criteria is the penalty for the number of parameters. The penalty is bigger in BIC, thus model minimizing it will ignore some predictors, that `model.AIC` consideres important enough.
+
+## Feature selection based on Information Value
+
+Fitting logistic regression models to a dataset containing numeric predictors has a degree of risk to it. The model assumes monotonic relation between the probability of success and a continuous feature. There is no guarantee that this relation must hold -- it could be the case for instance, that the probability that a client is good is the highest for middle aged clients, but lower for very young and very old ones. Logistic regression will fail to ilustrate this relation, because `age.in.years` is a numeric variable.
+
+This problem can be solved by discretization continuous predictors, which will allow each new class to have its own coefficient. This approach can lead to great increase in the number of parameters, so we should only discretize features we consider important.
+
+To assess predictive power of a feature we will use $WoE$ (Weight of Evidence) and $IV$ (Information Value). In order to estimate importance of feature $X$, taking $k$ values $(x_1, \ldots, x_k)$, we calculate
+\begin{equation*}
+  WoE(x_i) = \log\left(\frac{\mathbb{P}(X = x_i | \texttt{creditability} = \texttt{good})}{\mathbb{P}(X = x_i | \texttt{creditability} = \texttt{bad})}\right)
+\end{equation*}
+and 
+\begin{equation*}
+  IV = \sum_{i=1}^k \left[\mathbb{P}(X = x_i | \texttt{creditability} = \texttt{good}) - \mathbb{P}(X = x_i | \texttt{creditability} = \texttt{bad})\right] \cdot WoE(x_i).
+\end{equation*}
+
+Exact probabilities are of course not known, so we estimate them by taking appropriate frequencies from the training dataset. For instance, we take
+\begin{equation*}
+  \mathbb{P}(X = x_i | \texttt{creditability} = \texttt{good}) = \frac{\text{number of good clients that have value $x_i$ in $X$ feature}}{\text{number of good clients}}.
+\end{equation*}
+
+We consider predictor $X$ to be of middle predictive power, when $0.1 \leq IV < 0.3$ and of strong predictive power, when $IV \geq 0.3$.
+
+To find optimal bins for discretization, we use `woebin()` function from `scorecard` package. This function will also merge some classes of factor type features, if it increases the predictive power.
+
+```{r disc, include=FALSE}
+woe <- woebin(dt = as.data.frame(train),
+              y = "creditability",
+              positive = "good")
+```
+Post discretization, some classes of factor features have been merged (for instance `purpose` now has only `r length(woe$purpose$bin)` classes instead of `r length(levels(purpose))`) and also all numeric predictors have been changed to factors. For example, continuous predictor `credit.ammount` has been changed to factor with levels `r woe$credit.amount$bin`. Let us examine $IV$ value of every feature.
+
+```{r iv-data}
+# IV [inf.v]
+inf.v <- numeric(features.number)
+for (i in 1:features.number) {
+  inf.v[i] <- woe[[i]][[1,"total_iv"]]
+}
+
+# we choose only those where iv is high (>= 0.3 or 0.1)
+features <- colnames(train)[-21]
+features.iv.0.3 <- features[which(inf.v >= 0.3)]
+features.iv.0.1 <- features[which(inf.v >= 0.1)]
+
+data.iv <- as.data.frame(cbind(features,round(inf.v,4)))
+colnames(data.iv) <- c("features", "InformationValue")
+data.iv$InformationValue <- as.numeric(data.iv$InformationValue)
+
+pal <- c("Strong" = "coral2",
+         "Medium" = "deepskyblue2",
+         "Weak" = "darkgray")
+data.iv$PredictivePower <- ifelse(data.iv$InformationValue>= 0.3, yes="Strong", no=ifelse(data.iv$InformationValue>= 0.1, "Medium", "Weak"))
+```
+
+```{r iv-plot, fig.height=6.5, fig.cap="Information Value of discretized features."}
+ggplot(data.iv, aes(features, InformationValue, fill=PredictivePower))+
+  geom_bar(stat="identity")+
+  geom_hline(aes(yintercept=0.3, linetype="IV = 0.3"), colour=pal["Strong"])+
+  geom_hline(aes(yintercept=0.1, linetype="IV = 0.1"), colour=pal["Medium"])+
+  scale_linetype_manual(name="", values = c(2, 2), guide = guide_legend(override.aes = list(color = c(pal["Medium"], pal["Strong"]))))+
+  theme(axis.text.x=element_text(angle=45, hjust=1))+
+  scale_fill_manual(values = pal,
+                    limits = names(pal))
+```
+
+In the picture \@ref(fig:iv-plot), features with strong predictive power ($IV \geq 0.3$) have been coloured orange, while the ones with medium predictive power ($0.1 \leq IV \leq 0.3$) have been marked blue. We will construct two more logistic regression models (called `model.0.3` and `model.0.1`), where the former will only consider features with strong predictive power, while the  latter will consider those with medium or above predictive power.
+
+In order to do so, we will modify the training set in such a way, so that the values in it are compliant with our new discretization. This can be easily done using `woebin_ply()` from `scorecard` package.
+```{r iv-selection, include=FALSE}
+features.iv.all.0.3 <- c(features.iv.0.3, "creditability")
+
+train.selection.0.3 <- woebin_ply(dt = train[,features.iv.all.0.3],
+                                  bins = woe,
+                                  to = "bin") %>% mutate_if(is.character, as.factor)
+
+
+test.selection.0.3 <- woebin_ply(dt = test[,features.iv.all.0.3],
+                                  bins = woe,
+                                  to = "bin") %>% mutate_if(is.character, as.factor)
+
+
+features.iv.all.0.1 <- c(features.iv.0.1, "creditability")
+
+train.selection.0.1 <- woebin_ply(dt = train[,features.iv.all.0.1],
+                                  bins = woe,
+                                  to = "bin") %>% mutate_if(is.character, as.factor)
+
+test.selection.0.1 <- woebin_ply(dt = test[,features.iv.all.0.1],
+                                  bins = woe,
+                                  to = "bin") %>% mutate_if(is.character, as.factor)
+```
+
+
+```{r iv-models-1}
+model.0.3 <- glm(formula = creditability~.,
+          data = train.selection.0.3,
+          family = binomial("logit"))
+
+model.0.1 <- glm(formula = creditability~.,
+          data = train.selection.0.1,
+          family = binomial("logit"))
+```
+
+By discretizing continuous predictors, number of parameters in our models can increase significantly. Let us observe, that `model.0.1` consists of `r ncol(model.0.1$model)-1` features and `r length(model.0.1$coefficients)` parameters. While that number is not huge, if we had more numeric predictors, the increase in number of parameters could cause problems with the existance of their estimates. To prevent that, We can assign to each class of each feature its $WoE$ value, turning them into numeric features, which should greatly reduce the number of parameters. Before we do that, we should check the assumption about monotonic relation between probability of being a good client and $WoE$ values of subsequent classes of considered predictors.
+
+```{r woe-plot, fig.height=6, fig.cap="Estimated probability of being a good client based on $WoE$ for features with at least medium predictive power."}
+cols.to.check <- data.iv$features[data.iv$InformationValue >= 0.1]
+
+plot_woe <- function(col) {
+  ggplot(data=woe[[col]],aes(x=woe,y=posprob))+
+      geom_line()+
+      labs(title=col)
+}
+
+plots <- lapply(cols.to.check, plot_woe)
+do.call("grid.arrange", c(plots, ncol=3))
+```
+
+Based on figure \@ref(fig:woe-plot) we conclude, that the monotonicity assumption holds for each predictor. We can thus construct `model.0.3.new` and `model.0.1.new`, which consist of only numeric predictors.
+
+```{r iv-models-2, include=FALSE}
+train.selection.0.3.new <- woebin_ply(dt = train[,features.iv.all.0.3],
+                                      bins = woe,
+                                      to = "woe")
+
+test.selection.0.3.new <- woebin_ply(dt = test[,features.iv.all.0.3],
+                                      bins = woe,
+                                      to = "woe")
+
+model.0.3.new <- glm(formula = creditability~.,
+          data = train.selection.0.3.new,
+          family = binomial("logit"))
+
+
+train.selection.0.1.new <- woebin_ply(dt = train[,features.iv.all.0.1],
+                                      bins = woe,
+                                      to = "woe")
+
+test.selection.0.1.new <- woebin_ply(dt = test[,features.iv.all.0.1],
+                                      bins = woe,
+                                      to = "woe")
+
+model.0.1.new <- glm(formula = creditability~.,
+          data = train.selection.0.1.new,
+          family = binomial("logit"))
+```
+
+Models created in that way have Exactly one more parameter than the number of features considered by the model (`r length(model.0.1.new$coefficients)` in case of `model.0.1.new` and `r length(model.0.3.new$coefficients)` for `model.0.3.new`).
+
+We have created six logistic regression models. Let us now assess their quality.
+
+# Binary classifier evaluation
+
+To answer the question which model predicts clients creditability the best, we will make predictions based on the test dataset.
+```{r predictions}
+pred.AIC <- predict.glm(model.AIC,
+                              newdata = test,
+                              type = "response")
+pred.BIC <- predict.glm(model.BIC,
+                              newdata = test,
+                              type = "response")
+pred.0.3 <- predict.glm(model.0.3,
+                              newdata = test.selection.0.3,
+                              type = "response")
+pred.0.1 <- predict.glm(model.0.1,
+                              newdata = test.selection.0.1,
+                              type = "response")
+pred.0.3.new <- predict.glm(model.0.3.new,
+                              newdata = test.selection.0.3.new,
+                              type = "response")
+pred.0.1.new <- predict.glm(model.0.1.new,
+                              newdata = test.selection.0.1.new,
+                              type = "response") 
+```
+
+## Evaluation based on a confusion matrix
+
+Taking classifier described in \eqref{regklas} with threshold $c=\frac12$, we classify clients as either good or bad. The results will be compared to true labels and presented in a confusion matrix, which is a matrix of a form
+\begin{table}[H]
+\centering
+\begin{tabular}{rrr}
+  \hline
+ & bad & good \\ 
+  \hline
+bad &  $TN$ &  $FP$ \\ 
+  good &  $FN$ & $TP$ \\ 
+   \hline
+\end{tabular}
+\caption{Binary classifier confusion matrix} 
+\label{cm}
+\end{table}
+Rows represent true labels of variable `creditability`, while columns represent the models prediction. The values should be understood as:
+
+* $TN$ (True Negative) --- number of correctly classified bad clients,
+* $FP$ (False Positive) --- number of bad clients incorrectly classified as good clients,
+* $FN$ (False Negative) --- number of good clients incorrectly classified as bad clients,
+* $TP$ (True Positive) --- number of correctly classified good clients.
+
+```{r cm}
+cm.AIC <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.AIC > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+
+cm.BIC <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.BIC > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+
+cm.0.3 <- table(real = test.selection.0.3$creditability,
+              pred = recode_factor(as.factor(pred.0.3 > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+
+cm.0.1 <- table(real = test.selection.0.1$creditability,
+              pred = recode_factor(as.factor(pred.0.1 > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+
+cm.0.3.new <- table(real = test.selection.0.3.new$creditability,
+              pred = recode_factor(as.factor(pred.0.3.new > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+
+cm.0.1.new <- table(real = test.selection.0.1.new$creditability,
+              pred = recode_factor(as.factor(pred.0.1.new > 0.5),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+```
+
+```{r table-grid, results='asis'}
+# Create example data frames
+# Convert data frames to xtables
+table_list <- list(cm.AIC, cm.0.3, cm.0.3.new, cm.BIC, cm.0.1, cm.0.1.new)
+model_names <- c("model.AIC", "model.0.3", "model.0.3.new", "model.BIC", "model.0.1", "model.0.1.new")
+
+cat("\\begin{multicols}{2}\n")
+for (i in seq_along(table_list)) {
+  tab <- xtable(table_list[[i]], caption = paste0("Confusion matrix of \\texttt{", model_names[i], "}."), label = paste0("cm.", model_names[i]))
+  print(tab, table.placement = "H", comment=FALSE)
+  if (i == 3){cat("\\columnbreak\n")}
+}
+cat("\\end{multicols}")
+```
+Based on confusion matrices \ref{cm.model.AIC}--\ref{cm.model.0.1.new} we will calculate basic quality measures.
+
+\newpage
+
+We will focus on measures such as:
+
+* Accuracy $$ACC = \frac{TP + TN}{TP + TN + FP + FN},$$
+
+* Classification error $$1 - ACC = \frac{FP + FN}{TP + TN + FP + FN},$$
+
+* Positive prediction value $$PPV = \frac{TP}{TP + FP},$$
+
+* Negative prediction value $$NPV = \frac{TN}{TN + FN},$$
+
+* Sensitivity (true positive rate) $$TPR = \frac{TP}{TP + FN},$$
+
+* Specificity (true negative rate) $$TNR = \frac{TN}{TN + FP},$$
+
+* $F_1$-score $$F_1 = 2\frac{PPV \cdot TPR}{PPV + TPR}.$$
+
+Each of the above takes values from the interval $[0, 1]$, where 0 indicates the worst fit, while 1 indicates perfect classification (except classification error, where the interpretation is reversed).
+
+```{r measures}
+measures <- function(cm) {
+  tn <- cm[1,1]
+  fp <- cm[1,2]
+  fn <- cm[2,1]
+  tp <- cm[2,2]
+  
+  acc <- (tp + tn)/(tp + fp + fn + tn)
+  err <- 1 - acc
+  ppv <- tp / (tp + fp)
+  npv <- tn / (tn + fn)
+  sensitivity <- tp / (tp + fn)
+  specificity <- tn / (tn + fp)
+  f1 <- 2*ppv*sensitivity / (ppv + sensitivity)
+  return(c("accuracy" = acc, "error" = err, "PPV" = ppv, "NPV" = npv, "sensitivity" = sensitivity, "specificity" = specificity, "$F_1$" = f1))
+}
+```
+
+```{r measures-tab, results='asis'}
+tab <- rbind(measures(cm.AIC), measures(cm.BIC), measures(cm.0.3),
+             measures(cm.0.1), measures(cm.0.3.new), measures(cm.0.1.new))
+rownames(tab) <- c("model.AIC", "model.BIC", "model.0.3", "model.0.1", "model.0.3.new", "model.0.1.new")
+tab <- xtable(tab, caption = "Scoring models quality measures.", label="measures", digits = c(0, 4, 4, 4, 4, 4, 4, 4), align = c("l", "r", "r", "r", "r" , "r" , "r", "r"))
+print(tab, table.placement = "H", comment = FALSE, sanitize.text.function = identity)
+```
+Based just on table \ref{measures} it is not yet possible to conclude, which model is the best, since no one model is the best looking at all measures at once. It is worth noting though, `model.BIC` is the best by six out of seven measures, despite its simplicity (only `r length(model.BIC$coefficients)` parameters).
+
+## Evaluation based on ROC curve
+
+We will also make use of a different approach of quality assessment, based on a ROC curve. In order to define said curve, we will need to define sensitivity and specificity of a diagnostic test of a classifier defined in \eqref{regklas}. Let $p(\mathbf{X})$ be a random variable representing probability, that a client with characteristic $\mathbf{X}$ is a good client and $E$ be the label ("good"/"bad").
+
+\newpage
+
+For a fixed $c$, we define
+
+* $F(c) = \mathbb{P}(p(\mathbf{X}) \leq c\,|\,E = \text{"bad"})$ -- cumulative distribution function of $p(\mathbf{X})$ in the group of bad clients,
+
+* $G(c) = \mathbb{P}(p(\mathbf{X}) \leq c\,|\,E = \text{"good"})$ -- cumulative distribution function of $p(\mathbf{X})$ in the group of good clients,
+
+* $SE(c) = 1 - G(c)$ -- sensitivity of a diagnostic test of classifier $d$,
+
+* $SP(c) = F(c)$ -- specificity of a diagnostic test of classifier $d$.
+
+ROC curve is a set
+\begin{equation*}
+  ROC = \left\{ \left(1 - SP(c), SE(c)\right) : -\infty \leq c \leq \infty \right\}.
+\end{equation*}
+
+We only need to consider $c \in [0, 1]$, because random variable $p(\mathbf{X})$ takes only values from this interval.
+
+In practice, for $F(\cdot)$ and $G(\cdot)$ we take empirical distribution functions $F_n(\cdot)$ and $G_m(\cdot)$, calculated using data from groups of good and bad clients.
+
+```{r roc-plot, fig.height=5.25, fig.cap="ROC curves of considered models."}
+roc.AIC <- roc(test$creditability, pred.AIC, auc=TRUE)
+roc.BIC <- roc(test$creditability, pred.BIC, auc=TRUE)
+roc.0.3 <- roc(test.selection.0.3$creditability, pred.0.3, auc=TRUE)
+roc.0.1 <- roc(test.selection.0.1$creditability, pred.0.1, auc=TRUE)
+roc.0.3.new <- roc(test.selection.0.3.new$creditability, pred.0.3.new, auc=TRUE)
+roc.0.1.new <- roc(test.selection.0.1.new$creditability, pred.0.1.new, auc=TRUE)
+
+roc.list <- list(roc.AIC, roc.BIC, roc.0.3, roc.0.1, roc.0.3.new, roc.0.1.new)
+et.AIC <- paste0("model.AIC, AUC = ", round(roc.AIC$auc, 4))
+et.BIC <- paste0("model.BIC, AUC = ", round(roc.BIC$auc, 4))
+et.0.3 <- paste0("model.0.3, AUC = ", round(roc.0.3$auc, 4))
+et.0.1 <- paste0("model.0.1, AUC = ", round(roc.0.1$auc, 4))
+et.0.3.new <- paste0("model.0.3.new, AUC = ", round(roc.0.3.new$auc, 4))
+et.0.1.new <- paste0("model.0.1.new, AUC = ", round(roc.0.1.new$auc, 4))
+
+ggroc(roc.list, legacy.axes = TRUE)+
+  scale_color_discrete(labels=c(et.AIC, et.BIC, et.0.3, et.0.1, et.0.3.new, et.0.1.new))+
+  labs(x="1-Specificity", y= "Sensitivity",color="Model and AUC")+
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1),
+               color="darkgrey",
+               linetype="dashed")+
+  theme(legend.position=c(0.8,0.28))
+```
+
+From figure \@ref(fig:roc-plot) we see, that the ROC curves intersect. In order to decide which model is the best, we can compare the areas between their curves, i.e. $AUC$ values. The biggest $AUC$ is obtained for ROC curve of `model.0.1`.
+
+## Evaluation based on Kolmogorov-Smirnov statistic
+
+The last measure we will consider is the  Kolmogorov-Smirnov statistic. Its value is defined as
+\begin{equation*}
+D = \sup_{t \in [0, 1]}|F_n(t) - G_n(t)|,
+\end{equation*}
+where $F_n(\cdot)$ and $G_m(\cdot)$ are empirical distribution functions defined as before.
+
+The statistic takes values from the interval $[0, 1]$, where bigger number indicates better ability to differentiate between good and bad clients. The values of $K-S$ statistic of our models we present in table \ref{KS}.
+
+```{r ks, include=FALSE}
+ks.AIC <- perf_eva(pred = pred.AIC,
+                 label = test$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+
+ks.BIC <- perf_eva(pred = pred.BIC,
+                 label = test$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+
+ks.0.3 <- perf_eva(pred = pred.0.3,
+                 label = test.selection.0.3$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+
+ks.0.1 <- perf_eva(pred = pred.0.1,
+                 label = test.selection.0.1$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+
+ks.0.3.new <- perf_eva(pred = pred.0.3.new,
+                 label = test.selection.0.3.new$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+
+ks.0.1.new <- perf_eva(pred = pred.0.1.new,
+                 label = test.selection.0.1.new$creditability,
+                 binomial_metric = "ks",
+                 confusion_matrix = TRUE,
+                 threshold = 0.5,
+                 show_plot = "roc")$binomial_metric$dat$KS
+```
+
+```{r ks-table, results='asis'}
+tab <- matrix(c(ks.AIC, ks.BIC, ks.0.3, ks.0.1, ks.0.3.new, ks.0.1.new), nrow = 1)
+colnames(tab) <- c("model.AIC", "model.BIC", "model.0.3", "model.0.1", "model.0.3.new", "model.0.1.new")
+rownames(tab) <- "Statystyka K-S"
+tab <- xtable(tab, caption = "Kolmogorov-Smirnov statistic values.", label = "KS", digits = c(0, rep(4, 6)))
+print(tab, table.placement = "H", comment = F)
+```
+Kolmogorov-Smirnov statistic values indicate, that `model.0.1.new` provides the best distinction between good and bad clients, with `model.0.1` being a close second.
+
+## Choosing the best model
+
+Having six models and nine quality measures (7 based on confusion matrix, area under ROC curve and $K-S$ statistic), we will try to determine, which model is in some sense the best.
+
+Based on measures derived from confusion matrices (table \ref{measures}), the most promising model is `model.BIC`. We also consider models `model.AIC` and `model.0.1` worth considering, since they give satisfying results for each of the measures. Other models we deem worse, as they have much worse specificity value.
+
+Biggest areas under ROC curves we get successively for `model.0.1`, `model.0.1.new`, `model.BIC` and `model.AIC`. Other models we consider worse, because their AUC values are significantly lower.
+
+Based on Kolmogorov-Smirnov statistic, the best ability to distinguish between good and bad clients is shown by `model.0.1.new` and `model.0.1`.
+
+We take `model.0.1` as the best one, because apart from having the biggens area under ROC curve, it provided good values of every other considered measure.
+
+# Optimal threshold selection
+
+Until now, we have only considered threshold $c = \frac12$, i.e. client was predicted to be good, if the probability of them being a good client was at least 50\%. Let us now consider other $c$ values, selected for each model individually.
+
+By an optimal threshold we understand such a number $c$, such that classifier \eqref{regklas} optimizes some criterium. Of course, for different criteria we can obtain very different thresholds. In `optimalCutoff` package we have over 30 criteria, but we will only focus on three:
+
+1. minimizing $\sqrt{FPR^2 + FNR^2}$,
+
+2. maximizing $TP + TN$,
+
+3. maximizing Youden index: $TPR + TNR - 1$.
+
+$FPR$ and $FNR$ represent False Positive Rate and False Negative Rate, defined as
+\begin{equation*}
+  FPR = \frac{FP}{FP + TN}, \qquad FNR = \frac{FN}{FN + TP}.
+\end{equation*}
+
+Criterium 2 is equivalent with maximizing $ACC$.
+
+```{r optimal-cutoff}
+optimal.cutoff <- function(real, pred){
+  
+  zakres <- seq(0, 1, 0.01)
+  
+  n <- length(zakres)
+  
+  n1 <- which(zakres > min(pred))[1]
+  
+  n2 <- tail(which(zakres < max(pred)),1)
+  
+  criteria.results <- matrix(0, nrow=n, ncol=3)
+
+  for (i in 1:n) {
+    
+    cm <- table(real = real,
+                pred = recode_factor(as.factor(pred > zakres[i]),
+                                   "FALSE" = "bad", "TRUE" = "good")
+    )
+    
+    if(i < n1){
+      
+      tn <- 0
+      fn <- 0
+      fp <- cm[1,1]
+      tp <- cm[2,1]
+      
+    }
+    else if((i >= n1) & (i <= n2)){
+      
+      tn <- cm[1,1]
+      fn <- cm[2,1]
+      fp <- cm[1,2]
+      tp <- cm[2,2]
+      
+    }
+    else if(i > n2){
+    
+     tn <- cm[1,1]
+     fn <- cm[2,1]
+     fp <- 0
+     tp <- 0
+  }
+ 
+    fpr <- fp / (fp + tn)
+    fnr <- fn / (fn + tp)
+    
+    k1 <- sqrt( (fpr)**2 + (fnr)**2 )
+    
+    k2 <- tn + tp
+    
+    se <- tp / (tp + fn)
+    sp <- tn / (tn + fp)
+    
+    k3 <- se + sp - 1
+    
+    criteria.results[i,] <- c(k1,k2,k3)
+  }
+
+  c.1 <- zakres[which(criteria.results[,1] == min(criteria.results[,1]))][1]
+  c.2 <- zakres[which(criteria.results[,2] == max(criteria.results[,2]))][1]
+  c.3 <- zakres[which(criteria.results[,3] == max(criteria.results[,3]))][1]
+
+  return(c(c.1,c.2,c.3))
+}
+```
+
+```{r optimal-cutoff-models}
+opt.AIC <- optimal.cutoff(real = test$creditability,
+                          pred=pred.AIC)
+
+opt.BIC <- optimal.cutoff(real = test$creditability,
+                          pred=pred.BIC)
+
+opt.0.3 <- optimal.cutoff(real = test.selection.0.3$creditability,
+                          pred=pred.0.3)
+
+opt.0.1 <- optimal.cutoff(real = test.selection.0.1$creditability,
+                          pred=pred.0.1)
+
+opt.0.3.new <- optimal.cutoff(real = test.selection.0.3.new$creditability,
+                          pred=pred.0.3.new)
+
+opt.0.1.new <- optimal.cutoff(real = test.selection.0.1.new$creditability,
+                          pred=pred.0.1.new)
+```
+
+```{r optimal-cutoff-table, results='asis'}
+tab <- matrix(c(opt.AIC, opt.BIC, opt.0.3, opt.0.1, opt.0.3.new, opt.0.1.new), byrow=FALSE, nrow = 3)
+colnames(tab) <- c("model.AIC", "model.BIC", "model.0.3", "model.0.1", "model.0.3.new", "model.0.1.new")
+rownames(tab) <- c("kryterium 1.", "kryterium 2.", "kryterium 3.")
+
+tab <- xtable(tab, caption = "Optimal thresholds.", label="optcut", digits = c(0, rep(2, 6)))
+print(tab, table.placement = "H", comment=FALSE)
+```
+
+Let us verify, if thresholds in table \ref{optcut} indeed optimize corresponding criteria.
+
+```{r crit-diff}
+k.diff <- function(cm.old, cm.new, criterium) {
+  x <- measures(cm.old)
+  y <- measures(cm.new)
+  if (criterium==1){
+    k.old <- sqrt((1-x[["sensitivity"]])**2 + (1-x[["specificity"]])**2)
+    k.new <- sqrt((1-y[["sensitivity"]])**2 + (1-y[["specificity"]])**2)
+  }else if (criterium==2){
+    k.old <- x[["accuracy"]]
+    k.new <- y[["accuracy"]]
+  }else if (criterium==3){
+    k.old <- x[["sensitivity"]] + x[["specificity"]] - 1
+    k.new <- y[["sensitivity"]] + y[["specificity"]] - 1
+  }
+  return(c(k.old, k.new))
+}
+```
+```{r new-cm-AIC}
+cm.AIC.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.AIC > opt.AIC[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.AIC.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.AIC > opt.AIC[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.AIC.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.AIC > opt.AIC[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.AIC <- c(k.diff(cm.AIC, cm.AIC.1, 1), k.diff(cm.AIC, cm.AIC.2, 2), k.diff(cm.AIC, cm.AIC.3, 3))
+```
+```{r new-cm-BIC}
+cm.BIC.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.BIC > opt.BIC[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.BIC.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.BIC > opt.BIC[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.BIC.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.BIC > opt.BIC[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.BIC <- c(k.diff(cm.BIC, cm.BIC.1, 1), k.diff(cm.BIC, cm.BIC.2, 2), k.diff(cm.BIC, cm.BIC.3, 3))
+```
+```{r new-cm-0.3}
+cm.0.3.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3 > opt.0.3[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.3.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3 > opt.0.3[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.3.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3 > opt.0.3[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.0.3 <- c(k.diff(cm.0.3, cm.0.3.1, 1), k.diff(cm.0.3, cm.0.3.2, 2), k.diff(cm.0.3, cm.0.3.3, 3))
+```
+```{r new-cm-0.1}
+cm.0.1.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1 > opt.0.1[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.1.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1 > opt.0.1[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.1.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1 > opt.0.1[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.0.1 <- c(k.diff(cm.0.1, cm.0.1.1, 1), k.diff(cm.0.1, cm.0.1.2, 2), k.diff(cm.0.1, cm.0.1.3, 3))
+```
+```{r new-cm-0.3.new}
+cm.0.3.new.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3.new > opt.0.3.new[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.3.new.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3.new > opt.0.3.new[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.3.new.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.3.new > opt.0.3.new[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.0.3.new <- c(k.diff(cm.0.3.new, cm.0.3.new.1, 1), k.diff(cm.0.3.new, cm.0.3.new.2, 2), k.diff(cm.0.3.new, cm.0.3.new.3, 3))
+```
+```{r new-cm-0.1.new}
+cm.0.1.new.1 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1.new > opt.0.1.new[1]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.1.new.2 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1.new > opt.0.1.new[2]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+cm.0.1.new.3 <- table(real = test$creditability,
+              pred = recode_factor(as.factor(pred.0.1.new > opt.0.1.new[3]),
+                                   "FALSE" = "bad", "TRUE" = "good"))
+diff.0.1.new <- c(k.diff(cm.0.1.new, cm.0.1.new.1, 1), k.diff(cm.0.1.new, cm.0.1.new.2, 2), k.diff(cm.0.1.new, cm.0.1.new.3, 3))
+```
+
+```{r new-crit-table-1, results='asis'}
+tab <- matrix(c(diff.AIC, diff.BIC, diff.0.3), byrow=FALSE, nrow=6)
+colnames(tab) <- c("model.AIC", "model.BIC", "model.0.3")
+rownames(tab) <- c("criterium 1 for threshold 0.5", "criterium 1 for optimal threshold",
+                   "criterium 2 for threshold 0.5", "criterium 2 for optimal threshold",
+                   "criterium 3 for threshold 0.5", "criterium 3 for optimal threshold")
+
+tab <- xtable(tab, caption = "Selected criteria values for the first three models.", label="optcrit1", digits = c(0, rep(4, 3)), align = c("l", rep("r", 3)))
+print(tab, table.placement = "H", comment=FALSE)
+```
+```{r new-crit-table-2, results='asis'}
+tab <- matrix(c(diff.0.1, diff.0.3.new, diff.0.1.new), byrow=FALSE, nrow=6)
+colnames(tab) <- c("model.0.1", "model.0.3.new", "model.0.1.new")
+rownames(tab) <- c("criterium 1 for threshold 0.5", "criterium 1 for optimal threshold",
+                   "criterium 2 for threshold 0.5", "criterium 1 for optimal threshold",
+                   "criterium 3 for threshold 0.5", "criterium 1 for optimal threshold")
+
+tab <- xtable(tab, caption = "Selected criteria values for the second three models.", label="optcrit2", digits = c(0, rep(4, 3)), align = c("l", rep("r", 3)))
+print(tab, table.placement = "H", comment=FALSE)
+```
+
+Tables \ref{optcrit1} and \ref{optcrit2} show expected results. For each model and criterium, optimal threshold always provides better or identical results as thresholds $\frac12$.
